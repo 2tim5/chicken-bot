@@ -194,9 +194,13 @@ async def init_db() -> None:
 
 
 async def close_db() -> None:
-    """Закрыть соединение с БД."""
+    """Закрыть соединение с БД (с финальным commit, чтобы данные доехали на диск)."""
     global db
     if db is not None:
+        try:
+            await db.commit()
+        except Exception:
+            logger.exception("Ошибка при финальном commit перед закрытием БД")
         await db.close()
         db = None
         logger.info("Соединение с БД закрыто")
@@ -983,6 +987,145 @@ def _is_admin(message: Message) -> bool:
     return user is not None and ADMIN_ID is not None and user.id == ADMIN_ID
 
 
+async def send_backup(bot: Bot, caption: str = "💾 Бекап chickens.db") -> bool:
+    """Отправить файл chickens.db на ADMIN_ID. True при успехе."""
+    if ADMIN_ID is None:
+        return False
+    try:
+        await bot.send_document(ADMIN_ID, FSInputFile(DB_PATH), caption=caption)
+        return True
+    except FileNotFoundError:
+        logger.warning("Бекап: файл %s ещё не создан", DB_PATH)
+        return False
+    except Exception:
+        logger.exception("Бекап: не удалось отправить файл")
+        return False
+
+
+# ── Управление курочками (админ) ──────────────────────────────────────────
+
+
+def _resolve_target_user(message: Message) -> int | None:
+    """Определить target user_id: из реплая, из @username или числом в args.
+
+    Возвращает None, если не удалось определить (тогда нужно объяснение).
+    """
+    reply = message.reply_to_message
+    if reply is not None and reply.from_user is not None:
+        return reply.from_user.id
+    return None
+
+
+async def _admin_balance_reply(
+    message: Message, user_id: int, verb: str, amount: int
+) -> None:
+    """Показать результат операции над балансом."""
+    new_balance = await get_balance(user_id)
+    await message.reply(
+        f"✅ {verb} {amount} 🍗 пользователю id {user_id}.\n"
+        f"Новый баланс: {new_balance} 🍗."
+    )
+
+
+@dp.message(Command("set_balance"))
+async def admin_set_balance(message: Message, command: CommandObject) -> None:
+    """/set_balance <число> реплаем на пользователя — установить точный баланс."""
+    if not _is_admin(message):
+        return
+
+    target = _resolve_target_user(message)
+    if target is None:
+        await message.reply(
+            "Ответь этой командой на сообщение пользователя, чей баланс меняешь. "
+            "Формат: /set_balance 100"
+        )
+        return
+
+    try:
+        amount = int((command.args or "").strip())
+    except ValueError:
+        await message.reply("Укажи целое число. Формат: /set_balance 100")
+        return
+    if amount < 0:
+        await message.reply("Баланс не может быть отрицательным.")
+        return
+
+    assert db is not None
+    await _ensure_user(target)
+    await db.execute("UPDATE users SET chickens = ? WHERE user_id = ?", (amount, target))
+    await db.commit()
+    await _admin_balance_reply(message, target, "Установлено", amount)
+
+
+@dp.message(Command("add_balance"))
+async def admin_add_balance(message: Message, command: CommandObject) -> None:
+    """/add_balance <число> реплаем на пользователя — добавить курочек."""
+    if not _is_admin(message):
+        return
+
+    target = _resolve_target_user(message)
+    if target is None:
+        await message.reply(
+            "Ответь этой командой на сообщение пользователя. Формат: /add_balance 50"
+        )
+        return
+
+    try:
+        amount = int((command.args or "").strip())
+    except ValueError:
+        await message.reply("Укажи целое число. Формат: /add_balance 50")
+        return
+    if amount <= 0:
+        await message.reply("Число должно быть больше нуля.")
+        return
+
+    assert db is not None
+    await _ensure_user(target)
+    await db.execute(
+        "UPDATE users SET chickens = chickens + ? WHERE user_id = ?", (amount, target)
+    )
+    await db.commit()
+    await _admin_balance_reply(message, target, "Добавлено", amount)
+
+
+@dp.message(Command("sub_balance"))
+async def admin_sub_balance(message: Message, command: CommandObject) -> None:
+    """/sub_balance <число> реплаем на пользователя — убавить курочек."""
+    if not _is_admin(message):
+        return
+
+    target = _resolve_target_user(message)
+    if target is None:
+        await message.reply(
+            "Ответь этой командой на сообщение пользователя. Формат: /sub_balance 50"
+        )
+        return
+
+    try:
+        amount = int((command.args or "").strip())
+    except ValueError:
+        await message.reply("Укажи целое число. Формат: /sub_balance 50")
+        return
+    if amount <= 0:
+        await message.reply("Число должно быть больше нуля.")
+        return
+
+    assert db is not None
+    await _ensure_user(target)
+    # Атомарное уменьшение без ухода в минус (не ниже нуля)
+    cur = await db.execute(
+        "UPDATE users SET chickens = MAX(0, chickens - ?) WHERE user_id = ?",
+        (amount, target),
+    )
+    await db.commit()
+    # Посчитать, сколько реально списалось
+    new_balance = await get_balance(target)
+    await message.reply(
+        f"✅ Убавлено {amount} 🍗 (с округлением до нуля, если не хватало).\n"
+        f"Новый баланс: {new_balance} 🍗."
+    )
+
+
 @dp.message(Command("set_photo"))
 async def admin_set_photo(message: Message, command: CommandObject) -> None:
     """/set_photo <1-5> реплаем на фото — сохранить file_id стадии."""
@@ -1020,16 +1163,67 @@ async def admin_backup(message: Message) -> None:
     if ADMIN_ID is None:
         return
 
-    try:
-        await message.bot.send_document(
-            ADMIN_ID, FSInputFile(DB_PATH), caption="💾 Бекап chickens.db"
-        )
+    ok = await send_backup(message.bot)
+    if ok:
         await message.reply("✅ Бекап отправлен тебе в личку.")
-    except FileNotFoundError:
-        await message.reply("Файл chickens.db ещё не создан.")
+    else:
+        await message.reply(
+            "Не удалось отправить бекап. Проверь: "
+            "файл chickens.db существует и ты написал боту в ЛС /start."
+        )
+
+
+@dp.message(Command("restore"))
+async def admin_restore(message: Message) -> None:
+    """/restore — восстановить БД из файла chickens.db (ответом на документ)."""
+    if not _is_admin(message):
+        return
+
+    reply = message.reply_to_message
+    if reply is None or reply.document is None:
+        await message.reply(
+            "Чтобы восстановить базу, ответь этой командой на сообщение "
+            "с файлом chickens.db (тот самый, что присылал /backup)."
+        )
+        return
+
+    doc = reply.document
+    if not (doc.file_name or "").lower().endswith((".db", ".sqlite", ".sqlite3")):
+        await message.reply("Это не похоже на файл базы данных (.db).")
+        return
+
+    # Скачиваем файл в память
+    try:
+        file = await message.bot.get_file(doc.file_id)
+        buf = await message.bot.download_file(file.file_path)
     except Exception:
-        logger.exception("Не удалось отправить бекап")
-        await message.reply("Не удалось отправить бекап (напиши боту в ЛС /start).")
+        logger.exception("Восстановление: не удалось скачать файл")
+        await message.reply("Не удалось скачать файл.")
+        return
+
+    data = buf.read()
+    if not data.startswith(b"SQLite format 3"):
+        await message.reply("Это не валидный файл SQLite (нет заголовка).")
+        return
+
+    # Закрываем текущее соединение, заменяем файл, открываем заново
+    global db
+    try:
+        if db is not None:
+            await db.close()
+            db = None
+        with open(DB_PATH, "wb") as f:
+            f.write(data)
+        await init_db()
+        await message.reply("✅ База восстановлена. Данные загружены.")
+    except Exception:
+        logger.exception("Восстановление: ошибка записи")
+        # Пытаемся переоткрыть, чтобы бот не остался без БД
+        try:
+            await init_db()
+        except Exception:
+            logger.exception("Не удалось переоткрыть БД после сбоя")
+        await message.reply("Не удалось восстановить базу (см. логи).")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1056,14 +1250,22 @@ async def backup_loop() -> None:
         if ADMIN_ID is None or bot_instance is None:
             continue
         try:
-            await bot_instance.send_document(
-                ADMIN_ID,
-                FSInputFile(DB_PATH),
-                caption="💾 Авто-бекап chickens.db",
-            )
+            await send_backup(bot_instance, caption="💾 Авто-бекап chickens.db")
             logger.info("Авто-бекап отправлен админу %d", ADMIN_ID)
         except Exception:
             logger.exception("Не удалось отправить авто-бекап")
+
+
+async def startup_backup_once() -> None:
+    """Один раз после запуска: отправить бекап админу (если задан ADMIN_ID).
+
+    Небольшая пауза, чтобы polling успел стартовать и bot_instance был готов.
+    """
+    await asyncio.sleep(5)
+    if ADMIN_ID is None or bot_instance is None:
+        return
+    ok = await send_backup(bot_instance, caption="💾 Бекап при старте chickens.db")
+    logger.info("Бекап при старте: %s", "отправлен" if ok else "не удался")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1079,9 +1281,10 @@ async def on_startup() -> None:
     # Метаболизм Мии — всегда
     bg_tasks.append(asyncio.create_task(metabolism_loop()))
 
-    # Авто-бекап — только если задан ADMIN_ID
+    # Авто-бекап и бекап при старте — только если задан ADMIN_ID
     if ADMIN_ID is not None:
         bg_tasks.append(asyncio.create_task(backup_loop()))
+        bg_tasks.append(asyncio.create_task(startup_backup_once()))
 
 
 @dp.shutdown()
